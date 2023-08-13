@@ -88,7 +88,7 @@ func NewScraper(
 	ctx context.Context,
 	log *logger.Logger,
 	blob *blob.Bucket,
-	opts ...ScraperOption,
+	opts ...Option,
 ) (*Scraper, error) {
 	httpClient := retryablehttp.NewClient()
 	httpClient.HTTPClient = cleanhttp.DefaultClient() // not pooled
@@ -115,7 +115,7 @@ func NewScraper(
 		pw:              nil,
 	}
 	for _, opt := range opts {
-		opt.scraperOption(s)
+		opt.option(s)
 	}
 	p := pool.New().WithErrors()
 	p.Go(func() error {
@@ -138,44 +138,50 @@ func (s *Scraper) Close() {
 	s.closeBrowser(context.Background())
 }
 
-type ScraperOption interface {
-	scraperOption(s *Scraper)
+type Option interface {
+	option(s *Scraper) optionSeal
 }
 
-type scraperOption struct {
+type optionSeal struct{}
+
+type option struct {
 	fn func(s *Scraper)
 }
 
-func (o *scraperOption) scraperOption(s *Scraper) {
+func (o *option) option(s *Scraper) optionSeal {
 	o.fn(s)
+	return optionSeal{}
 }
 
-func OptScraperAlwaysDoBrowser() ScraperOption {
-	return &scraperOption{func(s *Scraper) {
+func OptScraperAlwaysDoBrowser() Option {
+	return &option{func(s *Scraper) {
 		s.alwaysDoBrowser = true
 	}}
 }
 
-type ErrFetchStatusNotOK struct {
+// FetchStatusNotOKError is returned when the fetch status is not 200 OK. The
+// Page contains the response and status.
+type FetchStatusNotOKError struct {
 	Page *Page
 }
 
-func (e *ErrFetchStatusNotOK) Error() string {
+func (e *FetchStatusNotOKError) Error() string {
 	return fmt.Sprintf("bad fetch status: %d", e.Page.Response.StatusCode)
 }
 
 func errPageStatusNotOK(page *Page) error {
 	if page.Response.StatusCode != 200 {
-		return &ErrFetchStatusNotOK{
+		return &FetchStatusNotOKError{
 			Page: page,
 		}
 	}
 	return nil
 }
 
-type ErrFetchThrottled struct{}
+// FetchThrottledError is returned when the fetch is throttled.
+type FetchThrottledError struct{}
 
-func (e *ErrFetchThrottled) Error() string {
+func (e *FetchThrottledError) Error() string {
 	return "fetch throtted"
 }
 
@@ -214,7 +220,7 @@ func (s *Scraper) Do(
 func (s *Scraper) startBrowser(
 	ctx context.Context,
 	log *logger.Logger,
-	opts doOptions,
+	_ doOptions,
 ) (err error) {
 	start := time.Now()
 
@@ -394,7 +400,7 @@ func (s *Scraper) closeBrowser(ctx context.Context) {
 // 		Debugf(ctx, "proxying request")
 
 // 	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
-// 		msg := "unsupported protocal scheme " + r.URL.Scheme
+// 		msg := "unsupported protocol scheme " + r.URL.Scheme
 // 		p.s.log.Errorf(ctx, msg)
 // 		http.Error(w, msg, http.StatusBadRequest)
 // 		return
@@ -443,10 +449,10 @@ type fetchFn func(
 ) (*Page, error)
 
 func (s *Scraper) fetchPlain(
-	ctx context.Context,
+	_ context.Context,
 	req *http.Request,
 	reqBody []byte,
-	opts doOptions,
+	_ doOptions,
 ) (*Page, error) {
 	rreq, err := retryablehttp.FromRequest(req)
 	if err != nil {
@@ -485,7 +491,7 @@ func (s *Scraper) fetchPlain(
 func (s *Scraper) fetchBrowser(
 	ctx context.Context,
 	req *http.Request,
-	reqBody []byte,
+	_ []byte,
 	opts doOptions,
 ) (*Page, error) {
 	if s.browser == nil {
@@ -505,21 +511,36 @@ func (s *Scraper) fetchBrowser(
 		page, err := fn()
 		if err != nil {
 			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route")
-			route.Fulfill(playwright.RouteFulfillOptions{
+			err2 := route.Fulfill(playwright.RouteFulfillOptions{
 				Status: playwright.Int(http.StatusInternalServerError),
 			})
+			if err2 != nil {
+				s.log.Fieldf("error", "%v", err2).Errorf(
+					ctx,
+					"failed to fulfill route (%d)",
+					http.StatusInternalServerError,
+				)
+			}
 			return
 		}
 		headers := make(map[string]string)
 		for key := range page.Response.Header {
 			headers[key] = page.Response.Header.Get(key)
 		}
-		route.Fulfill(playwright.RouteFulfillOptions{
+		err = route.Fulfill(playwright.RouteFulfillOptions{
 			Body: page.Response.Body,
 			// ContentType: why is this separate?
 			Headers: headers,
 			Status:  playwright.Int(page.Response.StatusCode),
 		})
+		if err != nil {
+			s.log.Fieldf("error", "%v", err).Errorf(
+				ctx,
+				"failed to fulfill route (%d)",
+				page.Response.StatusCode,
+			)
+			return
+		}
 	}
 	err = context.Route("**/*", func(route playwright.Route) {
 		fulfill(route, func() (*Page, error) {
@@ -593,7 +614,7 @@ func (s *Scraper) do(
 	ctx context.Context,
 	req *http.Request,
 	opts doOptions,
-	fetchFn fetchFn,
+	_ fetchFn,
 ) (page *Page, err error) {
 	start := time.Now()
 
@@ -604,7 +625,7 @@ func (s *Scraper) do(
 
 	if !opts.Replace {
 		b, err := s.blob.Read(ctx, bkey)
-		errNoExist := &blob.ErrNotFound{}
+		errNoExist := &blob.NotFoundError{}
 		if !errors.As(err, &errNoExist) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to read from blob: %w", err)
@@ -665,10 +686,10 @@ func (s *Scraper) do(
 		}
 		if opts.ReSilentThrottle != nil && opts.ReSilentThrottle.Match(body) {
 			n := requests.Load()
-			rate := float64(n) / (float64(time.Since(veryStart).Minutes()))
+			rate := float64(n) / (time.Since(veryStart).Minutes())
 			s.log.Fieldf("rate", "%0.3f/m", rate).Warnf(ctx, "silently throttled")
 			if lastAttempt {
-				return nil, &ErrFetchThrottled{}
+				return nil, &FetchThrottledError{}
 			}
 			s.log.Fieldf("attempt", "%d", i).Warnf(ctx, "response is silently throttled, retrying")
 			time.Sleep(10 * time.Second)
@@ -717,121 +738,121 @@ func (s *Scraper) do(
 	return page, nil
 }
 
-func (s *Scraper) doBrowser2(
-	ctx context.Context,
-	req *http.Request,
-	opts doOptions,
-) (*Page, error) {
-	if s.browser == nil {
-		panic("headless browser not running")
-	}
-	if req.Method != "GET" {
-		return nil, fmt.Errorf("browser only supports requests with GET method")
-	}
+// func (s *Scraper) doBrowser2(
+// 	ctx context.Context,
+// 	req *http.Request,
+// 	opts doOptions,
+// ) (*Page, error) {
+// 	if s.browser == nil {
+// 		panic("headless browser not running")
+// 	}
+// 	if req.Method != "GET" {
+// 		return nil, fmt.Errorf("browser only supports requests with GET method")
+// 	}
 
-	context, err := s.browser.NewContext(playwright.BrowserNewContextOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not create context: %w", err)
-	}
-	defer context.Close()
-	go func() {
-		<-ctx.Done()
-		context.Close()
-	}()
+// 	context, err := s.browser.NewContext(playwright.BrowserNewContextOptions{})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("could not create context: %w", err)
+// 	}
+// 	defer context.Close()
+// 	go func() {
+// 		<-ctx.Done()
+// 		context.Close()
+// 	}()
 
-	fulfill := func(route playwright.Route, fn func() (*Page, error)) {
-		page, err := fn()
-		if err != nil {
-			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route")
-			err := route.Fulfill(playwright.RouteFulfillOptions{
-				Status: playwright.Int(http.StatusInternalServerError),
-			})
-			if err != nil {
-				s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route (error)")
-			}
-			return
-		}
-		headers := make(map[string]string)
-		for key := range page.Response.Header {
-			headers[key] = page.Response.Header.Get(key)
-		}
-		err = route.Fulfill(playwright.RouteFulfillOptions{
-			Body: page.Response.Body,
-			// ContentType: why is this separate?
-			Headers: headers,
-			Status:  playwright.Int(page.Response.StatusCode),
-		})
-		if err != nil {
-			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route (error)")
-		}
-	}
-	err = context.Route("**/*", func(route playwright.Route) {
-		fulfill(route, func() (*Page, error) {
-			req := route.Request()
-			r, err := http.NewRequest(req.Method(), req.URL(), nil)
-			if err != nil {
-				return nil, fmt.Errorf("failed to make new request: %w", err)
-			}
-			// It is currently unsuppored to get all headers with
-			// ongoing MITM route. Blocks forever.
-			// https://github.com/playwright-community/playwright-go/blob/2586b38296886f7dcf63b305cb23791a4d84617d/request.go#L145
-			r.Header = make(http.Header)
-			for k, v := range req.Headers() {
-				r.Header.Set(k, v)
-			}
-			return s.do(ctx, r, opts, s.fetchPlain)
-		})
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to set browser context route: %w", err)
-	}
+// 	fulfill := func(route playwright.Route, fn func() (*Page, error)) {
+// 		page, err := fn()
+// 		if err != nil {
+// 			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route")
+// 			err := route.Fulfill(playwright.RouteFulfillOptions{
+// 				Status: playwright.Int(http.StatusInternalServerError),
+// 			})
+// 			if err != nil {
+// 				s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route (error)")
+// 			}
+// 			return
+// 		}
+// 		headers := make(map[string]string)
+// 		for key := range page.Response.Header {
+// 			headers[key] = page.Response.Header.Get(key)
+// 		}
+// 		err = route.Fulfill(playwright.RouteFulfillOptions{
+// 			Body: page.Response.Body,
+// 			// ContentType: why is this separate?
+// 			Headers: headers,
+// 			Status:  playwright.Int(page.Response.StatusCode),
+// 		})
+// 		if err != nil {
+// 			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route (error)")
+// 		}
+// 	}
+// 	err = context.Route("**/*", func(route playwright.Route) {
+// 		fulfill(route, func() (*Page, error) {
+// 			req := route.Request()
+// 			r, err := http.NewRequest(req.Method(), req.URL(), nil)
+// 			if err != nil {
+// 				return nil, fmt.Errorf("failed to make new request: %w", err)
+// 			}
+// 			// It is currently unsuppored to get all headers with
+// 			// ongoing MITM route. Blocks forever.
+// 			// https://github.com/playwright-community/playwright-go/blob/2586b38296886f7dcf63b305cb23791a4d84617d/request.go#L145
+// 			r.Header = make(http.Header)
+// 			for k, v := range req.Headers() {
+// 				r.Header.Set(k, v)
+// 			}
+// 			return s.do(ctx, r, opts, s.fetchPlain)
+// 		})
+// 	})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to set browser context route: %w", err)
+// 	}
 
-	page, err := context.NewPage()
-	if err != nil {
-		return nil, fmt.Errorf("could not create page: %w", err)
-	}
+// 	page, err := context.NewPage()
+// 	if err != nil {
+// 		return nil, fmt.Errorf("could not create page: %w", err)
+// 	}
 
-	page.On("request", func(request playwright.Request) {
-		s.log.Field("url", request.URL()).Debugf(ctx, "making page request")
-	})
-	page.On("response", func(request playwright.Response) {
-		s.log.Field("url", request.URL()).Debugf(ctx, "got page response")
-	})
+// 	page.On("request", func(request playwright.Request) {
+// 		s.log.Field("url", request.URL()).Debugf(ctx, "making page request")
+// 	})
+// 	page.On("response", func(request playwright.Response) {
+// 		s.log.Field("url", request.URL()).Debugf(ctx, "got page response")
+// 	})
 
-	resp, err := page.Goto(req.URL.String(), playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateNetworkidle,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("page failed to goto url: %w", err)
-	}
-	html, err := page.Content()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get content from page: %w", err)
-	}
-	respHeaders := make(http.Header)
-	allHeaders, err := resp.AllHeaders()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get page response headers: %w", err)
-	}
-	for key, value := range allHeaders {
-		respHeaders.Set(key, value)
-	}
-	return &Page{
-		ScrapedAt: time.Now(),
-		Request: PageRequest{
-			URL: resp.URL(),
-			// Unknown
-			// RedirectedURL: redirect,
-			Method: req.Method,
-			Header: respHeaders,
-			// XXX
-			Body: nil,
-		},
-		Response: PageResponse{
-			Body: []byte(html),
-		},
-	}, nil
-}
+// 	resp, err := page.Goto(req.URL.String(), playwright.PageGotoOptions{
+// 		WaitUntil: playwright.WaitUntilStateNetworkidle,
+// 	})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("page failed to goto url: %w", err)
+// 	}
+// 	html, err := page.Content()
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to get content from page: %w", err)
+// 	}
+// 	respHeaders := make(http.Header)
+// 	allHeaders, err := resp.AllHeaders()
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to get page response headers: %w", err)
+// 	}
+// 	for key, value := range allHeaders {
+// 		respHeaders.Set(key, value)
+// 	}
+// 	return &Page{
+// 		ScrapedAt: time.Now(),
+// 		Request: PageRequest{
+// 			URL: resp.URL(),
+// 			// Unknown
+// 			// RedirectedURL: redirect,
+// 			Method: req.Method,
+// 			Header: respHeaders,
+// 			// XXX
+// 			Body: nil,
+// 		},
+// 		Response: PageResponse{
+// 			Body: []byte(html),
+// 		},
+// 	}, nil
+// }
 
 func (s *Scraper) blobKey(req *http.Request) (string, []byte, error) {
 	buf := new(bytes.Buffer)

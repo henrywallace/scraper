@@ -99,21 +99,21 @@ func (o *OptBucketURL) bucketOption()      {}
 
 func newBucket(
 	ctx context.Context,
-	bucketUrl string,
+	bucketURL string,
 ) (*blob.Bucket, error) {
 	var bucket *blob.Bucket
 	var err error
 	switch {
-	case strings.HasPrefix(bucketUrl, "file://"):
-		dir := strings.TrimPrefix(bucketUrl, "file://")
+	case strings.HasPrefix(bucketURL, "file://"):
+		dir := strings.TrimPrefix(bucketURL, "file://")
 		bucket, err = fileblob.OpenBucket(dir, &fileblob.Options{
 			CreateDir: true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to open fileblob bucket %s: %w", dir, err)
 		}
-	case strings.HasPrefix(bucketUrl, "s3://"):
-		bucketName := strings.TrimRight(strings.TrimPrefix(bucketUrl, "s3://"), "/")
+	case strings.HasPrefix(bucketURL, "s3://"):
+		bucketName := strings.TrimRight(strings.TrimPrefix(bucketURL, "s3://"), "/")
 		cfg, err := config.LoadDefaultConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load default config: %w", err)
@@ -126,7 +126,7 @@ func newBucket(
 	default:
 		return nil, fmt.Errorf(
 			"unsupported bucket-url %s, supported schemes are file, s3",
-			bucketUrl,
+			bucketURL,
 		)
 	}
 	return bucket, nil
@@ -180,10 +180,10 @@ func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 	if b.cache != nil {
 		err := b.cache.View(func(txn *badger.Txn) error {
 			_, err := txn.Get(b.cacheKey(key))
-			if err != nil && err != badger.ErrKeyNotFound {
+			if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 				return err
 			}
-			if err != badger.ErrKeyNotFound {
+			if !errors.Is(err, badger.ErrKeyNotFound) {
 				exists = true
 			}
 			return nil
@@ -241,11 +241,12 @@ func (b *Bucket) Write(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
-type ErrNotFound struct {
+// NotFoundError is returned when a key is not found in the bucket.
+type NotFoundError struct {
 	Key string
 }
 
-func (e *ErrNotFound) Error() string {
+func (e *NotFoundError) Error() string {
 	return fmt.Sprintf("key not found: %s", e.Key)
 }
 
@@ -279,8 +280,8 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 				}
 				return nil
 			}
-			if err != badger.ErrKeyNotFound {
-				return &ErrNotFound{Key: key}
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return &NotFoundError{Key: key}
 			}
 			return nil
 		})
@@ -301,7 +302,7 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 		r, err := b.bucket.NewReader(ctx, key, opts)
 		if err != nil {
 			if gcerrors.Code(err) == gcerrors.NotFound {
-				return nil, &ErrNotFound{key}
+				return nil, &NotFoundError{key}
 			}
 			return nil, fmt.Errorf("failed to create bucket reader: %w", err)
 		}
@@ -329,11 +330,11 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 		return data, nil
 	}
 
-	return nil, &ErrNotFound{Key: key}
+	return nil, &NotFoundError{Key: key}
 }
 
 func (b *Bucket) List(
-	ctx context.Context,
+	_ context.Context,
 	options ...ListOption,
 ) *ListIterator {
 	prefix := mo.None[string]()
@@ -381,7 +382,7 @@ func (it *ListIterator) Next(ctx context.Context) bool {
 		return false
 	}
 	obj, err := it.it.Next(ctx)
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		it.done = true
 		return false
 	}

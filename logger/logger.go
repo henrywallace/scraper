@@ -12,7 +12,7 @@ type Logger struct {
 	prefix string
 }
 
-func NewLogger(ctx context.Context) *Logger {
+func NewLogger(_ context.Context) *Logger {
 	inner := logrus.New()
 	return &Logger{
 		inner:  inner.WithFields(logrus.Fields{}),
@@ -46,31 +46,31 @@ func (l *Logger) Fieldf(key string, format string, args ...interface{}) *Logger 
 	return l.Field(key, val)
 }
 
-func (l *Logger) Fatalf(ctx context.Context, format string, args ...interface{}) {
+func (l *Logger) Fatalf(_ context.Context, format string, args ...interface{}) {
 	l.inner.Fatalf(format, args...)
 }
 
-func (l *Logger) Errorf(ctx context.Context, format string, args ...interface{}) *Logger {
+func (l *Logger) Errorf(_ context.Context, format string, args ...interface{}) *Logger {
 	l.inner.Errorf(format, args...)
 	return l
 }
 
-func (l *Logger) Warnf(ctx context.Context, format string, args ...interface{}) *Logger {
+func (l *Logger) Warnf(_ context.Context, format string, args ...interface{}) *Logger {
 	l.inner.Warnf(format, args...)
 	return l
 }
 
-func (l *Logger) Infof(ctx context.Context, format string, args ...interface{}) *Logger {
+func (l *Logger) Infof(_ context.Context, format string, args ...interface{}) *Logger {
 	l.inner.Infof(format, args...)
 	return l
 }
 
-func (l *Logger) Debugf(ctx context.Context, format string, args ...interface{}) *Logger {
+func (l *Logger) Debugf(_ context.Context, format string, args ...interface{}) *Logger {
 	l.inner.Debugf(format, args...)
 	return l
 }
 
-func (l *Logger) Tracef(ctx context.Context, format string, args ...interface{}) *Logger {
+func (l *Logger) Tracef(_ context.Context, format string, args ...interface{}) *Logger {
 	l.inner.Tracef(format, args...)
 	return l
 }
