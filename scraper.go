@@ -633,7 +633,7 @@ func (s *Scraper) do(
 				return nil, fmt.Errorf("failed to read from blob: %w", err)
 			}
 			page := new(Page)
-			if err := json.Unmarshal(b, page); err != nil {
+			if err := json.Unmarshal(b.Data, page); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal page: %w", err)
 			}
 			if err := errPageStatusNotOK(page); err != nil {

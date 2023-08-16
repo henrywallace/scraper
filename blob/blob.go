@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/dgraph-io/badger/v3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/samber/lo"
 	"github.com/samber/mo"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
@@ -32,17 +34,15 @@ type Bucket struct {
 
 func NewBucket(
 	ctx context.Context,
+	bucketURL string,
 	options ...BucketOption,
 ) (*Bucket, error) {
-	var u string
+	log := log.Ctx(ctx)
 	var disableCache bool
 	for _, opt := range options {
 		switch opt := opt.(type) {
-		case *OptBucketURL:
-			u = opt.URL
-			if opt.DisableCache {
-				disableCache = true
-			}
+		case *OptBucketNoCache:
+			disableCache = opt.NoCache
 		}
 	}
 	var cache *badger.DB
@@ -56,19 +56,16 @@ func NewBucket(
 			}
 		}
 		cacheOpts := badger.DefaultOptions(cacheDir)
-		cacheOpts.Logger = newBadgerLogger(*log.Ctx(ctx))
+		cacheOpts.Logger = newBadgerLogger(*log)
 		cache, err = badger.Open(cacheOpts)
 		if err != nil {
 			return nil, err
 		}
 		log.Debug().Str("dir", cacheDir).Msg("opened badger cache")
 	}
-	var bucket *blob.Bucket
-	if u != "" {
-		bucket, err = newBucket(ctx, u)
-		if err != nil {
-			return nil, err
-		}
+	bucket, err := newBucket(ctx, bucketURL)
+	if err != nil {
+		return nil, err
 	}
 	return &Bucket{
 		prefix: "",
@@ -85,18 +82,23 @@ type OptBucketCacheDir struct {
 	CacheDir string
 }
 
-type OptBucketURL struct {
-	URL          string
-	DisableCache bool
+type OptBucketNoCache struct {
+	NoCache bool
 }
 
 func (o *OptBucketCacheDir) bucketOption() {}
-func (o *OptBucketURL) bucketOption()      {}
+func (o *OptBucketNoCache) bucketOption()  {}
+
+var reBucketURL = regexp.MustCompile(`^\w+://`)
 
 func newBucket(
 	ctx context.Context,
 	bucketURL string,
 ) (*blob.Bucket, error) {
+	log := log.Ctx(ctx)
+	if !reBucketURL.MatchString(bucketURL) {
+		bucketURL = "file://" + bucketURL
+	}
 	var bucket *blob.Bucket
 	var err error
 	switch {
@@ -129,36 +131,37 @@ func newBucket(
 	return bucket, nil
 }
 
-func (b *Bucket) WithPrefix(prefix string) *Bucket {
-	prefix = filepath.Join(b.prefix, prefix)
+// WithPrefix returns a new bucket with the given prefix.
+func (bu *Bucket) WithPrefix(prefix string) *Bucket {
+	prefix = filepath.Join(bu.prefix, prefix)
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 	var bucket *blob.Bucket
-	if b.bucket != nil {
-		bucket = blob.PrefixedBucket(b.bucket, prefix)
+	if bu.bucket != nil {
+		bucket = blob.PrefixedBucket(bu.bucket, prefix)
 	}
 	return &Bucket{
 		prefix: prefix,
 		bucket: bucket,
-		cache:  b.cache,
+		cache:  bu.cache,
 	}
 }
 
-func (b *Bucket) Close() {
-	if b.cache != nil {
-		if err := b.cache.Close(); err != nil {
+func (bu *Bucket) Close() {
+	if bu.cache != nil {
+		if err := bu.cache.Close(); err != nil {
 			log.Err(err).Msg("failed to close cache")
 		}
 	}
-	if b.bucket != nil {
-		if err := b.bucket.Close(); err != nil {
+	if bu.bucket != nil {
+		if err := bu.bucket.Close(); err != nil {
 			log.Err(err).Msg("failed to close bucket")
 		}
 	}
 }
 
-func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
+func (bu *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 	start := time.Now()
 	source := "remote"
 	defer func() {
@@ -173,9 +176,9 @@ func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 	}()
 	key += ".zst"
 	exists := false
-	if b.cache != nil {
-		err := b.cache.View(func(txn *badger.Txn) error {
-			_, err := txn.Get(b.cacheKey(key))
+	if bu.cache != nil {
+		err := bu.cache.View(func(txn *badger.Txn) error {
+			_, err := txn.Get(bu.cacheKey(key))
 			if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 				return err
 			}
@@ -192,17 +195,17 @@ func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 		source = "cache"
 		return exists, nil
 	}
-	if b.bucket != nil {
-		return b.bucket.Exists(ctx, key)
+	if bu.bucket != nil {
+		return bu.bucket.Exists(ctx, key)
 	}
 	return false, nil
 }
 
-func (b *Bucket) Write(ctx context.Context, key string, data []byte) error {
+func (bu *Bucket) Write(ctx context.Context, key string, data []byte) error {
 	key += ".zst"
-	if b.bucket != nil {
+	if bu.bucket != nil {
 		var opts *blob.WriterOptions
-		w, err := b.bucket.NewWriter(ctx, key, opts)
+		w, err := bu.bucket.NewWriter(ctx, key, opts)
 		if err != nil {
 			return fmt.Errorf("failed to create bucket writer: %w", err)
 		}
@@ -226,9 +229,9 @@ func (b *Bucket) Write(ctx context.Context, key string, data []byte) error {
 			return fmt.Errorf("failed to close bucket writer: %w", err)
 		}
 	}
-	if b.cache != nil {
-		err := b.cache.Update(func(txn *badger.Txn) error {
-			return txn.Set(b.cacheKey(key), data)
+	if bu.cache != nil {
+		err := bu.cache.Update(func(txn *badger.Txn) error {
+			return txn.Set(bu.cacheKey(key), data)
 		})
 		if err != nil {
 			log.Err(err).Msg("failed to set cache")
@@ -246,30 +249,34 @@ func (e *NotFoundError) Error() string {
 	return fmt.Sprintf("key not found: %s", e.Key)
 }
 
-func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) {
-	if b.cache == nil && b.bucket == nil {
+type Blob struct {
+	Data   []byte
+	Source string
+}
+
+func (bu *Bucket) Read(ctx context.Context, key string) (b *Blob, err error) {
+	if bu.cache == nil && bu.bucket == nil {
 		return nil, errors.New("neither cache nor external bucket is configured")
 	}
 
 	start := time.Now()
-	source := "remote"
 	defer func() {
 		if err != nil {
 			return
 		}
 		log.Debug().
-			Int("bytes", len(data)).
+			Int("bytes", len(b.Data)).
 			Stringer("dur", time.Since(start).Round(time.Microsecond)).
-			Str("source", source).
+			Str("source", b.Source).
 			Str("key", key).
 			Msg("bucket read")
 	}()
 	key = key + ".zst"
 
 	var cacheData []byte
-	if b.cache != nil {
-		err := b.cache.View(func(txn *badger.Txn) error {
-			item, err := txn.Get(b.cacheKey(key))
+	if bu.cache != nil {
+		err := bu.cache.View(func(txn *badger.Txn) error {
+			item, err := txn.Get(bu.cacheKey(key))
 			if err == nil {
 				cacheData, err = item.ValueCopy(nil)
 				if err != nil {
@@ -282,21 +289,20 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 			}
 			return nil
 		})
-		if err != nil {
-			if b.bucket == nil {
+		if err != nil && !errors.As(err, lo.ToPtr(&NotFoundError{})) {
+			if bu.bucket == nil {
 				return nil, fmt.Errorf("failed to read cache: %w", err)
 			}
 			log.Err(err).Msg("failed to read cache")
 		}
 	}
 	if cacheData != nil {
-		source = "cache"
-		return cacheData, nil
+		return &Blob{Data: cacheData, Source: "cache"}, nil
 	}
 
-	if b.bucket != nil {
+	if bu.bucket != nil {
 		var opts *blob.ReaderOptions
-		r, err := b.bucket.NewReader(ctx, key, opts)
+		r, err := bu.bucket.NewReader(ctx, key, opts)
 		if err != nil {
 			if gcerrors.Code(err) == gcerrors.NotFound {
 				return nil, &NotFoundError{key}
@@ -304,7 +310,7 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 			return nil, fmt.Errorf("failed to create bucket reader: %w", err)
 		}
 		zr := zstd.NewReader(r)
-		data, err = io.ReadAll(zr)
+		data, err := io.ReadAll(zr)
 		if err != nil {
 			_ = zr.Close()
 			_ = r.Close()
@@ -316,24 +322,21 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 		if err := r.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close bucket reader: %w", err)
 		}
-		if cacheData == nil && b.cache != nil {
-			err := b.cache.Update(func(txn *badger.Txn) error {
-				return txn.Set(b.cacheKey(key), data)
+		if cacheData == nil && bu.cache != nil {
+			err := bu.cache.Update(func(txn *badger.Txn) error {
+				return txn.Set(bu.cacheKey(key), data)
 			})
 			if err != nil {
 				log.Err(err).Msg("failed to set cache")
 			}
 		}
-		return data, nil
+		return &Blob{Data: data, Source: "remote"}, nil
 	}
 
 	return nil, &NotFoundError{Key: key}
 }
 
-func (b *Bucket) List(
-	_ context.Context,
-	options ...ListOption,
-) *ListIterator {
+func (bu *Bucket) List(options ...ListOption) *ListIterator {
 	prefix := mo.None[string]()
 	for _, opt := range options {
 		switch opt := opt.(type) {
@@ -344,11 +347,11 @@ func (b *Bucket) List(
 		}
 	}
 	// FIXME need support for cache-only
-	it := b.bucket.List(&blob.ListOptions{
+	it := bu.bucket.List(&blob.ListOptions{
 		Prefix: prefix.OrElse(""),
 	})
 	return &ListIterator{
-		b:    b,
+		b:    bu,
 		it:   it,
 		obj:  nil,
 		err:  nil,
@@ -395,12 +398,12 @@ func (it *ListIterator) Key() string {
 	return strings.TrimSuffix(it.obj.Key, ".zst")
 }
 
-func (it *ListIterator) Value(ctx context.Context) ([]byte, error) {
+func (it *ListIterator) Value(ctx context.Context) (*Blob, error) {
 	return it.b.Read(ctx, it.Key())
 }
 
-func (b *Bucket) cacheKey(key string) []byte {
-	return []byte(b.prefix + key)
+func (bu *Bucket) cacheKey(key string) []byte {
+	return []byte(bu.prefix + key)
 }
 
 var _ badger.Logger = (*badgerLogger)(nil)
