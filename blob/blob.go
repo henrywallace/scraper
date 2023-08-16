@@ -13,7 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/dgraph-io/badger/v3"
-	"github.com/henrywallace/scraper/logger"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/samber/mo"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
@@ -24,7 +25,6 @@ import (
 var defaultCacheDir = ".cache/scraper/blob/"
 
 type Bucket struct {
-	log    *logger.Logger
 	prefix string
 	bucket *blob.Bucket
 	cache  *badger.DB
@@ -32,7 +32,6 @@ type Bucket struct {
 
 func NewBucket(
 	ctx context.Context,
-	log *logger.Logger,
 	options ...BucketOption,
 ) (*Bucket, error) {
 	var u string
@@ -57,14 +56,12 @@ func NewBucket(
 			}
 		}
 		cacheOpts := badger.DefaultOptions(cacheDir)
-		cacheOpts.Logger = &badgerLogger{
-			ctx: ctx,
-			log: log,
-		}
+		cacheOpts.Logger = newBadgerLogger(*log.Ctx(ctx))
 		cache, err = badger.Open(cacheOpts)
 		if err != nil {
 			return nil, err
 		}
+		log.Debug().Str("dir", cacheDir).Msg("opened badger cache")
 	}
 	var bucket *blob.Bucket
 	if u != "" {
@@ -74,7 +71,6 @@ func NewBucket(
 		}
 	}
 	return &Bucket{
-		log:    log,
 		prefix: "",
 		bucket: bucket,
 		cache:  cache,
@@ -129,6 +125,7 @@ func newBucket(
 			bucketURL,
 		)
 	}
+	log.Debug().Str("url", bucketURL).Msg("opened bucket")
 	return bucket, nil
 }
 
@@ -142,7 +139,6 @@ func (b *Bucket) WithPrefix(prefix string) *Bucket {
 		bucket = blob.PrefixedBucket(b.bucket, prefix)
 	}
 	return &Bucket{
-		log:    b.log,
 		prefix: prefix,
 		bucket: bucket,
 		cache:  b.cache,
@@ -150,15 +146,14 @@ func (b *Bucket) WithPrefix(prefix string) *Bucket {
 }
 
 func (b *Bucket) Close() {
-	ctx := context.Background()
 	if b.cache != nil {
 		if err := b.cache.Close(); err != nil {
-			b.log.Errorf(ctx, "failed to close cache: %v", err)
+			log.Err(err).Msg("failed to close cache")
 		}
 	}
 	if b.bucket != nil {
 		if err := b.bucket.Close(); err != nil {
-			b.log.Errorf(ctx, "failed to close bucket: %v", err)
+			log.Err(err).Msg("failed to close bucket")
 		}
 	}
 }
@@ -170,10 +165,11 @@ func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 		if err != nil {
 			return
 		}
-		b.log.Fieldf("exists", "%t", ok).
-			Fieldf("dur", "%v", time.Since(start).Round(time.Microsecond)).
-			Field("source", source).
-			Debugf(ctx, "bucket exists")
+		log.Debug().
+			Bool("exists", ok).
+			Stringer("dur", time.Since(start).Round(time.Microsecond)).
+			Str("source", source).
+			Msg("bucket exists")
 	}()
 	key += ".zst"
 	exists := false
@@ -189,7 +185,7 @@ func (b *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 			return nil
 		})
 		if err != nil {
-			b.log.Errorf(ctx, "failed to check cache for existence: %v", err)
+			log.Err(err).Msg("failed to check cache for existence")
 		}
 	}
 	if exists {
@@ -235,7 +231,7 @@ func (b *Bucket) Write(ctx context.Context, key string, data []byte) error {
 			return txn.Set(b.cacheKey(key), data)
 		})
 		if err != nil {
-			b.log.Errorf(ctx, "failed to set cache: %v", err)
+			log.Err(err).Msg("failed to set cache")
 		}
 	}
 	return nil
@@ -261,11 +257,12 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 		if err != nil {
 			return
 		}
-		b.log.Fieldf("bytes", "%d", len(data)).
-			Fieldf("dur", "%v", time.Since(start).Round(time.Microsecond)).
-			Field("source", source).
-			Field("key", key).
-			Debugf(ctx, "bucket read")
+		log.Debug().
+			Int("bytes", len(data)).
+			Stringer("dur", time.Since(start).Round(time.Microsecond)).
+			Str("source", source).
+			Str("key", key).
+			Msg("bucket read")
 	}()
 	key = key + ".zst"
 
@@ -289,7 +286,7 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 			if b.bucket == nil {
 				return nil, fmt.Errorf("failed to read cache: %w", err)
 			}
-			b.log.Errorf(ctx, "failed to read cache: %v", err)
+			log.Err(err).Msg("failed to read cache")
 		}
 	}
 	if cacheData != nil {
@@ -324,7 +321,7 @@ func (b *Bucket) Read(ctx context.Context, key string) (data []byte, err error) 
 				return txn.Set(b.cacheKey(key), data)
 			})
 			if err != nil {
-				b.log.Errorf(ctx, "failed to set cache: %v", err)
+				log.Err(err).Msg("failed to set cache")
 			}
 		}
 		return data, nil
@@ -409,19 +406,37 @@ func (b *Bucket) cacheKey(key string) []byte {
 var _ badger.Logger = (*badgerLogger)(nil)
 
 type badgerLogger struct {
-	ctx context.Context
-	log *logger.Logger
+	zerolog.Logger
 }
 
-func (l *badgerLogger) Errorf(format string, args ...any) {
-	l.log.Errorf(l.ctx, format, args...)
+func newBadgerLogger(log zerolog.Logger) badgerLogger {
+	log = log.With().
+		Str("component", "cache").
+		Caller().
+		CallerWithSkipFrameCount(5).
+		Logger()
+	return badgerLogger{log}
 }
-func (l *badgerLogger) Warningf(format string, args ...any) {
-	l.log.Warnf(l.ctx, format, args...)
+
+func (l badgerLogger) Errorf(format string, args ...any) {
+	l.log(zerolog.ErrorLevel, format, args)
 }
-func (l *badgerLogger) Infof(format string, args ...any) {
-	l.log.Tracef(l.ctx, format, args...)
+
+func (l badgerLogger) Warningf(format string, args ...any) {
+	l.log(zerolog.WarnLevel, format, args)
 }
-func (l *badgerLogger) Debugf(format string, args ...any) {
-	l.log.Tracef(l.ctx, format, args...)
+
+// lower by 1, as these logs can be noisy
+func (l badgerLogger) Infof(format string, args ...any) {
+	l.log(zerolog.DebugLevel, format, args)
+}
+
+// lower by 1, as these logs can be noisy
+func (l badgerLogger) Debugf(format string, args ...any) {
+	l.log(zerolog.TraceLevel, format, args)
+}
+
+func (l badgerLogger) log(lvl zerolog.Level, format string, args []any) {
+	format = strings.TrimSpace(format) // some log messages misbehave
+	l.Logger.WithLevel(lvl).Msgf(format, args...)
 }

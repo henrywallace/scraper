@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -25,11 +24,13 @@ import (
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/playwright-community/playwright-go"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/samber/lo"
 	"github.com/sourcegraph/conc/pool"
 	"go.uber.org/ratelimit"
 
 	"github.com/henrywallace/scraper/blob"
-	"github.com/henrywallace/scraper/logger"
 )
 
 var veryStart = time.Now()
@@ -54,7 +55,7 @@ func init() {
 	parts := strings.SplitN(rateLimitRaw, "/", 2)
 	rate, err := strconv.ParseInt(parts[0], 10, 0)
 	if err != nil {
-		log.Fatalf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
+		log.Fatal().Msgf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
 	}
 	var opts []ratelimit.Option
 	if len(parts) == 2 {
@@ -65,7 +66,7 @@ func init() {
 		dur, err := time.ParseDuration(per)
 		if err != nil {
 			if err != nil {
-				log.Fatalf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
+				log.Fatal().Msgf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
 			}
 		}
 		opts = append(opts, ratelimit.Per(dur))
@@ -74,9 +75,8 @@ func init() {
 }
 
 type Scraper struct {
-	log             *logger.Logger
 	httpClient      *retryablehttp.Client
-	blob            *blob.Bucket
+	bucket          *blob.Bucket
 	mu              *sync.Mutex
 	pw              *playwright.Playwright
 	browser         playwright.Browser
@@ -86,13 +86,12 @@ type Scraper struct {
 
 func NewScraper(
 	ctx context.Context,
-	log *logger.Logger,
 	blob *blob.Bucket,
 	opts ...Option,
 ) (*Scraper, error) {
 	httpClient := retryablehttp.NewClient()
 	httpClient.HTTPClient = cleanhttp.DefaultClient() // not pooled
-	httpClient.Logger = newLeveledLogger(log)
+	httpClient.Logger = leveledLogger{log.Ctx(ctx)}
 	httpClient.RequestLogHook = func(_ retryablehttp.Logger, req *http.Request, i int) {
 		if rateLimitOverride != nil {
 			rateLimitOverride.Take()
@@ -105,9 +104,8 @@ func NewScraper(
 		requests.Add(1)
 	}
 	s := &Scraper{
-		log:             log,
 		httpClient:      httpClient,
-		blob:            blob,
+		bucket:          blob,
 		mu:              new(sync.Mutex),
 		browser:         nil,
 		alwaysDoBrowser: false,
@@ -119,7 +117,7 @@ func NewScraper(
 	}
 	p := pool.New().WithErrors()
 	p.Go(func() error {
-		return s.startBrowser(ctx, log, doOptions{
+		return s.startBrowser(doOptions{
 			Replace:          false,
 			ReSilentThrottle: nil,
 			Limiter:          nil,
@@ -135,7 +133,7 @@ func (s *Scraper) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.closeBrowser(context.Background())
+	s.closeBrowser()
 }
 
 type Option interface {
@@ -217,11 +215,7 @@ func (s *Scraper) Do(
 	return s.do(ctx, req, opts, fn)
 }
 
-func (s *Scraper) startBrowser(
-	ctx context.Context,
-	log *logger.Logger,
-	_ doOptions,
-) (err error) {
+func (s *Scraper) startBrowser(_ doOptions) (err error) {
 	start := time.Now()
 
 	s.mu.Lock()
@@ -297,7 +291,7 @@ func (s *Scraper) startBrowser(
 	// 	}
 	// }
 
-	log.Debugf(ctx, "starting playwright instance")
+	log.Debug().Msg("starting playwright instance")
 	pw, err := playwright.Run(&playwright.RunOptions{
 		Verbose: true,
 	})
@@ -306,7 +300,7 @@ func (s *Scraper) startBrowser(
 		return fmt.Errorf("failed to run playwright instance: %w", err)
 	}
 	s.pw = pw
-	log.Debugf(ctx, "starting headless chromium browser")
+	log.Debug().Msg("starting headless chromium browser")
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(true),
 		// Proxy: &playwright.BrowserTypeLaunchOptionsProxy{
@@ -322,21 +316,22 @@ func (s *Scraper) startBrowser(
 	}
 	s.browser = browser
 
-	s.log.Fieldf("dur", fmt.Sprintf("%v", time.Since(start).Round(time.Microsecond))).
-		Debugf(ctx, "browser ready")
+	log.Debug().
+		Stringer("dur", time.Since(start).Round(time.Microsecond)).
+		Msg("browser ready")
 	return nil
 }
 
-func (s *Scraper) closeBrowser(ctx context.Context) {
+func (s *Scraper) closeBrowser() {
 	if s.browser != nil {
 		if err := s.browser.Close(); err != nil {
-			s.log.Errorf(ctx, "failed to close browser: %v", err)
+			log.Err(err).Msg("failed to close browser")
 		}
 		s.browser = nil
 	}
 	if s.pw != nil {
 		if err := s.pw.Stop(); err != nil {
-			s.log.Errorf(ctx, "failed to close playwright instance: %v", err)
+			log.Err(err).Msg("failed to close playwright instance")
 		}
 		s.pw = nil
 	}
@@ -510,13 +505,12 @@ func (s *Scraper) fetchBrowser(
 	fulfill := func(route playwright.Route, fn func() (*Page, error)) {
 		page, err := fn()
 		if err != nil {
-			s.log.Fieldf("error", "%v", err).Errorf(ctx, "failed to fulfill route")
+			log.Err(err).Msg("failed to fulfill route")
 			err2 := route.Fulfill(playwright.RouteFulfillOptions{
 				Status: playwright.Int(http.StatusInternalServerError),
 			})
 			if err2 != nil {
-				s.log.Fieldf("error", "%v", err2).Errorf(
-					ctx,
+				log.Err(err2).Msgf(
 					"failed to fulfill route (%d)",
 					http.StatusInternalServerError,
 				)
@@ -534,8 +528,7 @@ func (s *Scraper) fetchBrowser(
 			Status:  playwright.Int(page.Response.StatusCode),
 		})
 		if err != nil {
-			s.log.Fieldf("error", "%v", err).Errorf(
-				ctx,
+			log.Err(err).Msgf(
 				"failed to fulfill route (%d)",
 				page.Response.StatusCode,
 			)
@@ -568,11 +561,20 @@ func (s *Scraper) fetchBrowser(
 		return nil, fmt.Errorf("could not create page: %w", err)
 	}
 
-	page.On("request", func(request playwright.Request) {
-		s.log.Field("url", request.URL()).Debugf(ctx, "making page request")
+	page.On("request", func(req playwright.Request) {
+		log.Debug().
+			Str("url", req.URL()).
+			Str("method", req.Method()).
+			Msg("making page request")
 	})
-	page.On("response", func(request playwright.Response) {
-		s.log.Field("url", request.URL()).Debugf(ctx, "got page response")
+	page.On("response", func(resp playwright.Response) {
+		b, _ := resp.Body()
+		log.Debug().
+			Str("url", resp.URL()).
+			Int("status", resp.Status()).
+			// Stringer("dur", time.Since(resp.Request().Timing().StartTime))  FIXME
+			Int("bytes", len(b)).
+			Msg("got page response")
 	})
 
 	resp, err := page.Goto(req.URL.String(), playwright.PageGotoOptions{
@@ -624,7 +626,7 @@ func (s *Scraper) do(
 	}
 
 	if !opts.Replace {
-		b, err := s.blob.Read(ctx, bkey)
+		b, err := s.bucket.Read(ctx, bkey)
 		errNoExist := &blob.NotFoundError{}
 		if !errors.As(err, &errNoExist) {
 			if err != nil {
@@ -680,18 +682,20 @@ func (s *Scraper) do(
 			if lastAttempt {
 				return nil, fmt.Errorf("failed to read http resp body: %w", err)
 			}
-			s.log.Fieldf("attempt", "%d", i).Warnf(ctx, "failed to read http resp body, retrying: %v", err)
+			log.Warn().Err(err).Int("attempt", i).Msg("failed to read http resp body, retrying")
 			wait(i)
 			continue
 		}
 		if opts.ReSilentThrottle != nil && opts.ReSilentThrottle.Match(body) {
 			n := requests.Load()
 			rate := float64(n) / (time.Since(veryStart).Minutes())
-			s.log.Fieldf("rate", "%0.3f/m", rate).Warnf(ctx, "silently throttled")
+			log.Warn().
+				Str("rate", fmt.Sprintf("%0.3f/m", rate)).
+				Msg("silently throttled")
 			if lastAttempt {
 				return nil, &FetchThrottledError{}
 			}
-			s.log.Fieldf("attempt", "%d", i).Warnf(ctx, "response is silently throttled, retrying")
+			log.Warn().Int("attempt", i).Msg("response is silently throttled, retrying")
 			time.Sleep(10 * time.Second)
 			wait(i)
 			continue
@@ -722,19 +726,20 @@ func (s *Scraper) do(
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal page: %w", err)
 	}
-	if err := s.blob.Write(ctx, bkey, b); err != nil {
+	if err := s.bucket.Write(ctx, bkey, b); err != nil {
 		return nil, fmt.Errorf("failed to write page: %w", err)
 	}
 	if err := errPageStatusNotOK(page); err != nil {
 		return nil, err
 	}
-	s.log.Field("url", req.URL.String()).
-		Field("status", fmt.Sprintf("%d", page.Response.StatusCode)).
-		Field("resp_bytes", fmt.Sprintf("%d", len(page.Response.Body))).
-		Field("dur", fmt.Sprintf("%v", time.Since(start).Round(time.Millisecond))).
-		Field("content_type", resp.Header.Get("Content-Type")).
-		Field("req_body", string(reqBody)).
-		Debugf(ctx, "fetched http page")
+	log.Info().
+		Stringer("url", req.URL).
+		Int("status", page.Response.StatusCode).
+		Int("resp_bytes", len(page.Response.Body)).
+		Stringer("dur", time.Since(start).Round(time.Millisecond)).
+		Str("content_type", page.Response.Header.Get("Content-Type")).
+		Str("req_body", string(reqBody)).
+		Msg("fetched http page")
 	return page, nil
 }
 
@@ -932,42 +937,41 @@ func (o *OptDoBrowser) doOption()        {}
 
 var _ retryablehttp.LeveledLogger = (*leveledLogger)(nil)
 
-type leveledLogger struct {
-	ctx context.Context
-	log *logger.Logger
-}
+type leveledLogger struct{ log *zerolog.Logger }
 
-func newLeveledLogger(log *logger.Logger) *leveledLogger {
-	return &leveledLogger{
-		ctx: context.Background(),
-		log: log,
-	}
-}
-
-func (l leveledLogger) fields(keysAndValues []any) *logger.Logger {
-	log := l.log
+func (l leveledLogger) fields(keysAndValues []any) *zerolog.Logger {
+	log := l.log.With()
 	for i := 0; i < len(keysAndValues); i += 2 {
 		key := fmt.Sprintf("%v", keysAndValues[i])
-		val := fmt.Sprintf("%v", keysAndValues[i+1])
-		log = log.Field(key, val)
+		val := keysAndValues[i+1]
+		switch val := val.(type) {
+		case int:
+			log = log.Int(key, val)
+		case string:
+			log = log.Str(key, val)
+		case fmt.Stringer:
+			log = log.Stringer(key, val)
+		default:
+			log = log.Interface(key, val)
+		}
 	}
-	return log
+	return lo.ToPtr(log.Logger())
 }
 
 func (l leveledLogger) Error(msg string, keysAndValues ...any) {
-	l.fields(keysAndValues).Errorf(l.ctx, msg)
+	l.fields(keysAndValues).Error().Msg(msg)
 }
 
 func (l leveledLogger) Warn(msg string, keysAndValues ...any) {
-	l.fields(keysAndValues).Warnf(l.ctx, msg)
+	l.fields(keysAndValues).Warn().Msg(msg)
 }
 
 func (l leveledLogger) Info(msg string, keysAndValues ...any) {
-	l.fields(keysAndValues).Tracef(l.ctx, msg)
+	l.fields(keysAndValues).Trace().Msg(msg)
 }
 
 func (l leveledLogger) Debug(msg string, keysAndValues ...any) {
-	l.fields(keysAndValues).Tracef(l.ctx, msg)
+	l.fields(keysAndValues).Trace().Msg(msg)
 }
 
 type Page struct {
