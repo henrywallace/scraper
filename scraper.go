@@ -436,38 +436,108 @@ type doOptions struct {
 	Limiter          Limiter
 }
 
+// ctx is not added to req
 type fetchFn func(
 	ctx context.Context,
 	req *http.Request,
-	reqBody []byte,
 	opts doOptions,
 ) (*Page, error)
 
+const maxRequestBodySize = 10 * 1024 * 1024 // 10 MB
+
+// fetchPlain retrieves the content of a given HTTP request and returns it
+// structured in a Page.
+//
+// To ensure that the request body can be read multiple times without being
+// consumed, the body is first read for the returned Page and stored in a byte
+// slice, then reassigned to the request.
+//
+// To prevent potential DoS we use http.MaxBytesReader to cap the size of the
+// request body that can be read.
 func (s *Scraper) fetchPlain(
 	_ context.Context,
 	req *http.Request,
-	reqBody []byte,
-	_ doOptions,
+	opts doOptions,
 ) (*Page, error) {
-	rreq, err := retryablehttp.FromRequest(req)
+	start := time.Now()
+
+	// Preserve and limit the original request body for multiple reads:
+	// once for persistence on the Page, and then again to restore the
+	// original request's then drained body.
+	reqBody, err := io.ReadAll(http.MaxBytesReader(nil, req.Body, maxRequestBodySize))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read http req body: %w", err)
 	}
-	resp, err := s.httpClient.Do(rreq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to perform http get: %w", err)
+	req.Body = io.NopCloser(bytes.NewBuffer(reqBody))
+
+	// Retry, as reading the body can fail outside the purview of the
+	// retryablehttp api. Or, the read body could indicate that the request
+	// should be retried. Adding it to the CheckRetry func would be awkward
+	// as it would involve conditionally forwarding an already read body.
+	var resp *http.Response
+	var body []byte
+	attemptsMax := 7
+	waitMin := 1 * time.Second
+	waitMax := 4 * time.Minute
+	waitJitter := 1 * time.Second
+	wait := func(attempt int) {
+		d := time.Duration(math.Pow(2, float64(attempt))) * waitMin
+		d += time.Duration(rand.Intn(int(waitJitter)))
+		if d > waitMax {
+			d = waitMax
+		}
+		time.Sleep(d)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read http resp body: %w", err)
+	for i := 0; i < attemptsMax; i++ {
+		rreq, err := retryablehttp.FromRequest(req)
+		if err != nil {
+			return nil, err
+		}
+		resp, err = s.httpClient.Do(rreq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to perform http get: %w", err)
+		}
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		lastAttempt := i >= attemptsMax-1
+		if err != nil {
+			if lastAttempt {
+				return nil, fmt.Errorf("failed to read http resp body: %w", err)
+			}
+			log.Warn().Int("attempt", i).Msg("failed to read http resp body, retrying")
+			wait(i)
+			continue
+		}
+		if opts.ReSilentThrottle != nil && opts.ReSilentThrottle.Match(body) {
+			n := requests.Load()
+			rate := float64(n) / (time.Since(veryStart).Minutes())
+			log.Warn().
+				Str("rate", fmt.Sprintf("%0.3f/m", rate)).
+				Msg("silently throttled")
+			if lastAttempt {
+				return nil, &FetchThrottledError{}
+			}
+			log.Warn().Int("attempt", i).Msg("response is silently throttled, retrying")
+			time.Sleep(10 * time.Second)
+			wait(i)
+			continue
+		}
+		break
 	}
-	resp.Body.Close()
+
 	redirect := ""
 	if resp.Request.URL.String() != req.URL.String() {
 		redirect = resp.Request.URL.String()
 	}
+	dur := time.Since(start)
 	return &Page{
-		ScrapedAt: time.Now(),
+		Meta: PageMeta{
+			Version:     LatestPageVersion,
+			Source:      "http.plain",
+			RetrieveDur: time.Since(start),
+			ScrapedAt:   time.Now(),
+			FetchDur:    dur,
+		},
 		Request: PageRequest{
 			URL:           req.URL.String(),
 			RedirectedURL: redirect,
@@ -486,7 +556,6 @@ func (s *Scraper) fetchPlain(
 func (s *Scraper) fetchBrowser(
 	ctx context.Context,
 	req *http.Request,
-	_ []byte,
 	opts doOptions,
 ) (*Page, error) {
 	if s.browser == nil {
@@ -523,7 +592,7 @@ func (s *Scraper) fetchBrowser(
 		}
 		err = route.Fulfill(playwright.RouteFulfillOptions{
 			Body: page.Response.Body,
-			// ContentType: why is this separate?
+			// ContentType: why is this separate from headers?
 			Headers: headers,
 			Status:  playwright.Int(page.Response.StatusCode),
 		})
@@ -596,15 +665,17 @@ func (s *Scraper) fetchBrowser(
 		respHeaders.Set(key, value)
 	}
 	return &Page{
-		ScrapedAt: time.Now(),
+		Meta: PageMeta{
+			Version:   LatestPageVersion,
+			Source:    "http.browser",
+			ScrapedAt: time.Now(),
+		},
 		Request: PageRequest{
-			URL: resp.URL(),
-			// Unknown
-			// RedirectedURL: redirect,
-			Method: req.Method,
-			Header: respHeaders,
-			// XXX
-			Body: nil,
+			URL:           resp.URL(),
+			RedirectedURL: "", // unknown
+			Method:        req.Method,
+			Header:        respHeaders,
+			Body:          nil,
 		},
 		Response: PageResponse{
 			Body: []byte(html),
@@ -616,7 +687,7 @@ func (s *Scraper) do(
 	ctx context.Context,
 	req *http.Request,
 	opts doOptions,
-	_ fetchFn,
+	fetchFn fetchFn,
 ) (page *Page, err error) {
 	start := time.Now()
 
@@ -627,8 +698,7 @@ func (s *Scraper) do(
 
 	if !opts.Replace {
 		b, err := s.bucket.Read(ctx, bkey)
-		errNoExist := &blob.NotFoundError{}
-		if !errors.As(err, &errNoExist) {
+		if !errors.As(err, lo.ToPtr(&blob.NotFoundError{})) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to read from blob: %w", err)
 			}
@@ -639,6 +709,7 @@ func (s *Scraper) do(
 			if err := errPageStatusNotOK(page); err != nil {
 				return nil, err
 			}
+			page.Meta.Source = b.Source
 			return page, nil
 		}
 	}
@@ -648,79 +719,9 @@ func (s *Scraper) do(
 		rctx = context.WithValue(rctx, ctxKeyLimiter{}, ctxValLimiter{opts.Limiter})
 		req = req.WithContext(rctx)
 	}
-	// Retry, as reading the body can fail outside the purview of the
-	// retryablehttp api. Or, the read body could indicate that the request
-	// should be retried. Adding it to the CheckRetry func would be awkward
-	// as it would involve conditionally forwarding an already read body.
-	var resp *http.Response
-	var body []byte
-	attemptsMax := 7
-	waitMin := 1 * time.Second
-	waitMax := 4 * time.Minute
-	waitJitter := 1 * time.Second
-	wait := func(attempt int) {
-		d := time.Duration(math.Pow(2, float64(attempt))) * waitMin
-		d += time.Duration(rand.Intn(int(waitJitter)))
-		if d > waitMax {
-			d = waitMax
-		}
-		time.Sleep(d)
-	}
-	for i := 0; i < attemptsMax; i++ {
-		rreq, err := retryablehttp.FromRequest(req)
-		if err != nil {
-			return nil, err
-		}
-		resp, err = s.httpClient.Do(rreq)
-		if err != nil {
-			return nil, fmt.Errorf("failed to perform http get: %w", err)
-		}
-		body, err = io.ReadAll(resp.Body)
-		resp.Body.Close()
-		lastAttempt := i >= attemptsMax-1
-		if err != nil {
-			if lastAttempt {
-				return nil, fmt.Errorf("failed to read http resp body: %w", err)
-			}
-			log.Warn().Err(err).Int("attempt", i).Msg("failed to read http resp body, retrying")
-			wait(i)
-			continue
-		}
-		if opts.ReSilentThrottle != nil && opts.ReSilentThrottle.Match(body) {
-			n := requests.Load()
-			rate := float64(n) / (time.Since(veryStart).Minutes())
-			log.Warn().
-				Str("rate", fmt.Sprintf("%0.3f/m", rate)).
-				Msg("silently throttled")
-			if lastAttempt {
-				return nil, &FetchThrottledError{}
-			}
-			log.Warn().Int("attempt", i).Msg("response is silently throttled, retrying")
-			time.Sleep(10 * time.Second)
-			wait(i)
-			continue
-		}
-		break
-	}
-
-	redirect := ""
-	if resp.Request.URL.String() != req.URL.String() {
-		redirect = resp.Request.URL.String()
-	}
-	page = &Page{
-		ScrapedAt: time.Now(),
-		Request: PageRequest{
-			URL:           req.URL.String(),
-			RedirectedURL: redirect,
-			Method:        req.Method,
-			Header:        resp.Request.Header,
-			Body:          reqBody,
-		},
-		Response: PageResponse{
-			StatusCode: resp.StatusCode,
-			Header:     resp.Header,
-			Body:       body,
-		},
+	page, err = fetchFn(ctx, req, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch page: %w", err)
 	}
 	b, err := json.Marshal(page)
 	if err != nil {
@@ -974,10 +975,20 @@ func (l leveledLogger) Debug(msg string, keysAndValues ...any) {
 	l.fields(keysAndValues).Trace().Msg(msg)
 }
 
+const LatestPageVersion = 0
+
 type Page struct {
-	ScrapedAt time.Time    `json:"scraped_at"`
-	Request   PageRequest  `json:"request"`
-	Response  PageResponse `json:"response"`
+	Meta     PageMeta     `json:"meta"`
+	Request  PageRequest  `json:"request"`
+	Response PageResponse `json:"response"`
+}
+
+type PageMeta struct {
+	Version     uint16        `json:"version"`
+	Source      string        `json:"-"`
+	RetrieveDur time.Duration `json:"-"`
+	ScrapedAt   time.Time     `json:"scraped_at"`
+	FetchDur    time.Duration `json:"fetch_dur"`
 }
 
 type PageRequest struct {
