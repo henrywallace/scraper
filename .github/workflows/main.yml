@@ -32,6 +32,9 @@ jobs:
       with:
         version: latest
         args: --timeout=10m
+  just-lint:
+    runs-on: ubuntu-latest
+    steps:
     - name: Download and setup `just`
       env:
         JUST_REPO_URL: "https://github.com/casey/just/releases/download"
@@ -41,12 +44,12 @@ jobs:
         set -euxo pipefail
         TMP_DIR=$(mktemp -d)
         DOWNLOAD_URL="${JUST_REPO_URL}/${JUST_VERSION}/just-${JUST_VERSION}-${JUST_PLATFORM}.tar.gz"
-        curl -L $DOWNLOAD_URL -o $TMP_DIR/just.tar.gz
-        ls -lhF $TMP_DIR/just.tar.gz
+        curl -L "$DOWNLOAD_URL" -o "$TMP_DIR/just.tar.gz"
+        ls -lhF "$TMP_DIR/just.tar.gz"
         echo "19848d0282e95f30188305b1bbd5a087793e5c6f27f5ac98207ab256027183df $TMP_DIR/just.tar.gz" | sha256sum --check
-        tar xvf $TMP_DIR/just.tar.gz -C $TMP_DIR
-        mv $TMP_DIR/just /usr/local/bin/
-        rm -rf $TMP_DIR
+        tar xvf "$TMP_DIR/just.tar.gz" -C "$TMP_DIR"
+        mv "$TMP_DIR/just" /usr/local/bin/
+        rm -rf "$TMP_DIR"
         which just
         just --version
     - run: go install github.com/google/yamlfmt/cmd/yamlfmt@latest
