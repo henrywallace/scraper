@@ -16,6 +16,22 @@ jobs:
     - uses: actions/setup-node@v3
       with:
         node-version: "18.17"
+    # Always save cache for apt/lists, as the playwright install --with-deps
+    # below will do an apt-get upgrade under the hood, which we want to save no
+    # matter the success of subsequent step success.
+    #
+    # https://github.com/actions/cache/tree/main/save#always-save-cache
+    - uses: actions/cache@v3
+      if: always()
+      with:
+        path: /var/lib/apt/lists
+        key: ${{ runner.os }}-apt
+    - uses: actions/cache@v3
+      with:
+        path: |
+          /home/runner/.cache/ms-playwright-go
+          /home/runner/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright
     - run: npm install playwright@1.37.1
     - run: go mod download
     - run: go run github.com/playwright-community/playwright-go/cmd/playwright install --with-deps
