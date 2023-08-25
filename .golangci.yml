@@ -1,0 +1,22 @@
+linters:
+  enable:
+    - asasalint
+    - bidichk
+    - bodyclose
+    - durationcheck
+    - errname
+    - errorlint
+    - exportloopref
+    - gocheckcompilerdirectives
+    - importas
+    - makezero
+    - mirror
+    - misspell
+    - musttag
+    - nilnil
+    - tenv
+    - thelper
+    - tparallel
+    - unconvert
+    - wastedassign
+    - zerologlint
