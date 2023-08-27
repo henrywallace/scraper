@@ -38,6 +38,7 @@ var requests atomic.Uint64
 
 var envRateLimit = "SCRAPER_RATE_LIMIT"
 var rateLimitOverride ratelimit.Limiter
+var defaultRateLimit = ratelimit.New(100)
 
 var reNumbericPrefix = regexp.MustCompile(`^\d+`)
 
@@ -99,6 +100,8 @@ func NewScraper(
 			val, ok := req.Context().Value(ctxKeyLimiter{}).(ctxValLimiter)
 			if ok {
 				val.Limiter.Take()
+			} else {
+				defaultRateLimit.Take()
 			}
 		}
 		requests.Add(1)
