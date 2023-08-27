@@ -27,7 +27,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
-	"github.com/sourcegraph/conc/pool"
 	"go.uber.org/ratelimit"
 
 	"github.com/henrywallace/scraper/blob"
@@ -81,7 +80,7 @@ type Scraper struct {
 	pw              *playwright.Playwright
 	browser         playwright.Browser
 	alwaysDoBrowser bool
-	browserReady    chan struct{}
+	startBrowser    func() error
 }
 
 func NewScraper(
@@ -109,24 +108,21 @@ func NewScraper(
 		httpClient:      httpClient,
 		bucket:          blob,
 		mu:              new(sync.Mutex),
+		pw:              nil,
 		browser:         nil,
 		alwaysDoBrowser: false,
-		browserReady:    make(chan struct{}),
-		pw:              nil,
+		startBrowser:    nil,
 	}
+	s.startBrowser = sync.OnceValue(s.newBrowser)
 	for _, opt := range opts {
 		opt.option(s)
 	}
-	p := pool.New().WithErrors()
-	p.Go(func() error {
-		return s.startBrowser(doOptions{
-			Replace:          false,
-			ReSilentThrottle: nil,
-			Limiter:          nil,
-		})
-	})
-	if err := p.Wait(); err != nil {
-		return nil, err
+	// If always do browser, then fail fast, until waiting for the first
+	// Do.
+	if s.alwaysDoBrowser {
+		if err := s.startBrowser(); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -217,16 +213,11 @@ func (s *Scraper) Do(
 	return s.do(ctx, req, opts, fn)
 }
 
-func (s *Scraper) startBrowser(_ doOptions) (err error) {
+func (s *Scraper) newBrowser() (err error) {
 	start := time.Now()
 
 	s.mu.Lock()
-	defer func() {
-		if err == nil {
-			close(s.browserReady)
-		}
-		s.mu.Unlock()
-	}()
+	defer s.mu.Unlock()
 
 	// proxyUsername := cryptoRandomString(4)
 	// proxyPassword := cryptoRandomString(20)
@@ -561,13 +552,25 @@ func (s *Scraper) fetchBrowser(
 	opts doOptions,
 ) (*Page, error) {
 	if s.browser == nil {
-		panic("headless browser not running")
+		// As scrapers do not always do browser requests, we lazily
+		// start the browser.
+		if err := s.startBrowser(); err != nil {
+			return nil, fmt.Errorf("failed to start browser: %w", err)
+		}
+	}
+	if !s.browser.IsConnected() {
+		return nil, fmt.Errorf("browser is not connected")
 	}
 	if req.Method != "GET" {
 		return nil, fmt.Errorf("browser only supports requests with GET method")
 	}
 
-	context, err := s.browser.NewContext(playwright.BrowserNewContextOptions{})
+	context, err := s.browser.NewContext(playwright.BrowserNewContextOptions{
+		// From docs when using Browser.Route: "We recommend disabling
+		// Service Workers when using request interception by setting
+		// `Browser.newContext.serviceWorkers` to `'block'`."
+		ServiceWorkers: playwright.ServiceWorkerPolicyBlock,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("could not create context: %w", err)
 	}
