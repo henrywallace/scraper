@@ -45,6 +45,7 @@ var reNumbericPrefix = regexp.MustCompile(`^\d+`)
 func init() {
 	rateLimitRaw, ok := os.LookupEnv(envRateLimit)
 	if !ok {
+		log.Debug().Msgf("%s not set, using default", envRateLimit)
 		return
 	}
 	switch strings.ToLower(rateLimitRaw) {
@@ -66,9 +67,7 @@ func init() {
 		}
 		dur, err := time.ParseDuration(per)
 		if err != nil {
-			if err != nil {
-				log.Fatal().Msgf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
-			}
+			log.Fatal().Msgf("failed to parse %s=%q: %v", envRateLimit, rateLimitRaw, err)
 		}
 		opts = append(opts, ratelimit.Per(dur))
 	}
@@ -303,7 +302,7 @@ func (s *Scraper) startBrowser(_ doOptions) (err error) {
 		return fmt.Errorf("failed to run playwright instance: %w", err)
 	}
 	s.pw = pw
-	log.Debug().Msg("starting headless chromium browser")
+	log.Debug().Msg("launching headless chromium browser")
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(true),
 		// Proxy: &playwright.BrowserTypeLaunchOptionsProxy{
@@ -614,9 +613,9 @@ func (s *Scraper) fetchBrowser(
 			if err != nil {
 				return nil, fmt.Errorf("failed to make new request: %w", err)
 			}
-			// It is currently unsuppored to get all headers with
-			// ongoing MITM route. Blocks forever.
-			// https://github.com/playwright-community/playwright-go/blob/2586b38296886f7dcf63b305cb23791a4d84617d/request.go#L145
+			// req.Headers() does not include security headers such
+			// as, as opposed to req.AllHeaders(). And the headers
+			// are lower-cased.
 			r.Header = make(http.Header)
 			for k, v := range req.Headers() {
 				r.Header.Set(k, v)
@@ -625,7 +624,7 @@ func (s *Scraper) fetchBrowser(
 		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to set browser context route: %w", err)
+		return nil, fmt.Errorf("failed to intercept browser routes: %w", err)
 	}
 
 	page, err := context.NewPage()
@@ -637,7 +636,7 @@ func (s *Scraper) fetchBrowser(
 		log.Debug().
 			Str("url", req.URL()).
 			Str("method", req.Method()).
-			Msg("making page request")
+			Msg("browser making page request")
 	})
 	page.On("response", func(resp playwright.Response) {
 		b, _ := resp.Body()
