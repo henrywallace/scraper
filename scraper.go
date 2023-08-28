@@ -74,13 +74,15 @@ func init() {
 }
 
 type Scraper struct {
-	httpClient      *retryablehttp.Client
-	bucket          *blob.Bucket
-	mu              *sync.Mutex
-	pw              *playwright.Playwright
-	browser         playwright.Browser
-	alwaysDoBrowser bool
-	startBrowser    func() error
+	httpClient       *retryablehttp.Client
+	bucket           *blob.Bucket
+	mu               *sync.Mutex
+	pw               *playwright.Playwright
+	browser          playwright.Browser
+	alwaysDoBrowser  bool
+	startBrowser     func() error
+	requestBodyLimit int64 // no limit when <= 0
+	respBodyLimit    int64 // no limit when <= 0
 }
 
 func NewScraper(
@@ -105,13 +107,15 @@ func NewScraper(
 		requests.Add(1)
 	}
 	s := &Scraper{
-		httpClient:      httpClient,
-		bucket:          blob,
-		mu:              new(sync.Mutex),
-		pw:              nil,
-		browser:         nil,
-		alwaysDoBrowser: false,
-		startBrowser:    nil,
+		httpClient:       httpClient,
+		bucket:           blob,
+		mu:               new(sync.Mutex),
+		pw:               nil,
+		browser:          nil,
+		alwaysDoBrowser:  false,
+		startBrowser:     nil,
+		requestBodyLimit: 10e6,  // 10 MB
+		respBodyLimit:    100e6, // 100 MB
 	}
 	s.startBrowser = sync.OnceValue(s.newBrowser)
 	for _, opt := range opts {
@@ -271,38 +275,26 @@ type doOptions struct {
 }
 
 // ctx is not added to req
+// already read body from req
 type fetchFn func(
 	ctx context.Context,
 	req *http.Request,
+	reqBody []byte,
 	opts doOptions,
 ) (*Page, error)
 
-const maxRequestBodySize = 10 * 1024 * 1024 // 10 MB
-
 // fetchPlain retrieves the content of a given HTTP request and returns it
 // structured in a Page.
-//
-// To ensure that the request body can be read multiple times without being
-// consumed, the body is first read for the returned Page and stored in a byte
-// slice, then reassigned to the request.
 //
 // To prevent potential DoS we use http.MaxBytesReader to cap the size of the
 // request body that can be read.
 func (s *Scraper) fetchPlain(
 	_ context.Context,
 	req *http.Request,
+	reqBody []byte,
 	opts doOptions,
 ) (*Page, error) {
 	start := time.Now()
-
-	// Preserve and limit the original request body for multiple reads:
-	// once for persistence on the Page, and then again to restore the
-	// original request's then drained body.
-	reqBody, err := io.ReadAll(http.MaxBytesReader(nil, req.Body, maxRequestBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read http req body: %w", err)
-	}
-	req.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 
 	// Retry, as reading the body can fail outside the purview of the
 	// retryablehttp api. Or, the read body could indicate that the request
@@ -331,7 +323,11 @@ func (s *Scraper) fetchPlain(
 		if err != nil {
 			return nil, fmt.Errorf("failed to perform http get: %w", err)
 		}
-		body, err = io.ReadAll(resp.Body)
+		rdr := resp.Body
+		if s.respBodyLimit > 0 {
+			rdr = http.MaxBytesReader(nil, resp.Body, s.respBodyLimit)
+		}
+		body, err = io.ReadAll(rdr)
 		resp.Body.Close()
 		lastAttempt := i >= attemptsMax-1
 		if err != nil {
@@ -390,6 +386,7 @@ func (s *Scraper) fetchPlain(
 func (s *Scraper) fetchBrowser(
 	ctx context.Context,
 	req *http.Request,
+	_ []byte,
 	opts doOptions,
 ) (*Page, error) {
 	if s.browser == nil {
@@ -555,7 +552,7 @@ func (s *Scraper) do(
 		rctx = context.WithValue(rctx, ctxKeyLimiter{}, ctxValLimiter{opts.Limiter})
 		req = req.WithContext(rctx)
 	}
-	page, err = fetchFn(ctx, req, opts)
+	page, err = fetchFn(ctx, req, reqBody, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch page: %w", err)
 	}
@@ -582,35 +579,27 @@ func (s *Scraper) do(
 
 func (s *Scraper) blobKey(req *http.Request) (string, []byte, error) {
 	buf := new(bytes.Buffer)
-
 	if _, err := buf.WriteString(req.URL.String()); err != nil {
 		return "", nil, err
 	}
 	if _, err := buf.WriteString("."); err != nil {
 		return "", nil, err
 	}
-
 	if _, err := buf.WriteString(req.Method); err != nil {
 		return "", nil, err
 	}
 	if _, err := buf.WriteString("."); err != nil {
 		return "", nil, err
 	}
-
 	if err := req.Header.WriteSubset(buf, nil); err != nil {
 		return "", nil, err
 	}
 	if _, err := buf.WriteString("."); err != nil {
 		return "", nil, err
 	}
-
-	var body []byte
-	if req.Body != nil {
-		var err error
-		body, err = io.ReadAll(req.Body)
-		if err != nil {
-			return "", nil, err
-		}
+	body, err := s.peekRequestBody(req)
+	if err != nil {
+		return "", nil, err
 	}
 	if _, err := buf.Write(body); err != nil {
 		return "", nil, err
@@ -618,12 +607,34 @@ func (s *Scraper) blobKey(req *http.Request) (string, []byte, error) {
 	if _, err := buf.WriteString("."); err != nil {
 		return "", nil, err
 	}
-	req.Body = io.NopCloser(bytes.NewBuffer(body))
-
 	h := sha256.Sum256(buf.Bytes())
 	henc := base64.RawURLEncoding.EncodeToString(h[:])
 	bkey := filepath.Join(req.URL.Hostname(), henc) + ".json"
 	return bkey, body, nil
+}
+
+// Preserve and limit the original request body for multiple reads:
+// once for persistence on the Page, and then again to restore the
+// original request's then drained body.
+func (s *Scraper) peekRequestBody(req *http.Request) ([]byte, error) {
+	var body []byte
+	// MaxBytesReader panics if req.Body is nil, so we must protect against
+	// it.
+	if req.Body != nil {
+		rdr := req.Body
+		if s.requestBodyLimit > 0 {
+			rdr = http.MaxBytesReader(nil, req.Body, s.requestBodyLimit)
+		}
+		var err error
+		body, err = io.ReadAll(rdr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read http req body: %w", err)
+		}
+	}
+	// Best to always do this even when req.Body == nil, to avoid subtle
+	// downstream differences between the original body and io.NopCloser.
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+	return body, nil
 }
 
 type DoOption interface {
