@@ -233,17 +233,14 @@ func (s *Scraper) newBrowser() (err error) {
 	s.pw = pw
 	log.Debug().Msg("launching headless chromium browser")
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
-		Headless: playwright.Bool(true),
-		// Proxy: &playwright.BrowserTypeLaunchOptionsProxy{
-		// 	Server:   playwright.String(proxyURL),
-		// 	Username: playwright.String(proxyUsername),
-		// 	Password: &proxyPassword,
-		// 	Bypass:   playwright.String("clients2.google.com"),
-		// },
-		// TracesDir: playwright.String("traces"),
+		Headless:        playwright.Bool(true),
+		ChromiumSandbox: playwright.Bool(true),
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to launch browser: %w", err)
+	}
+	if !browser.IsConnected() {
+		return fmt.Errorf("browser is not connected")
 	}
 	s.browser = browser
 
