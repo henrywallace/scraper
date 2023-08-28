@@ -386,7 +386,7 @@ func (s *Scraper) fetchPlain(
 func (s *Scraper) fetchBrowser(
 	ctx context.Context,
 	req *http.Request,
-	_ []byte,
+	reqBody []byte,
 	opts doOptions,
 ) (*Page, error) {
 	if s.browser == nil {
@@ -504,14 +504,16 @@ func (s *Scraper) fetchBrowser(
 			ScrapedAt: time.Now(),
 		},
 		Request: PageRequest{
-			URL:           resp.URL(),
-			RedirectedURL: "", // unknown
+			URL:           req.URL.String(),
+			RedirectedURL: resp.URL(),
 			Method:        req.Method,
 			Header:        header,
-			Body:          nil,
+			Body:          reqBody,
 		},
 		Response: PageResponse{
-			Body: []byte(html),
+			StatusCode: resp.Status(),
+			Header:     header,
+			Body:       []byte(html),
 		},
 	}, nil
 }
