@@ -24,7 +24,8 @@ import (
 	"gocloud.dev/gcerrors"
 )
 
-var defaultCacheDir = ".cache/scraper/blob/"
+const defaultCacheDir = ".cache/scraper/blob/"
+const defaultCacheTTL = 24 * time.Hour
 
 type Bucket struct {
 	prefix string
@@ -55,8 +56,8 @@ func NewBucket(
 				cacheDir = opt.CacheDir
 			}
 		}
-		cacheOpts := badger.DefaultOptions(cacheDir)
-		cacheOpts.Logger = newBadgerLogger(*log)
+		cacheOpts := badger.DefaultOptions(cacheDir).
+			WithLogger(newBadgerLogger(*log))
 		cache, err = badger.Open(cacheOpts)
 		if err != nil {
 			return nil, err
@@ -68,7 +69,7 @@ func NewBucket(
 		return nil, err
 	}
 	return &Bucket{
-		prefix: "",
+		prefix: "", // not namespaced
 		bucket: bucket,
 		cache:  cache,
 	}, nil
@@ -201,7 +202,17 @@ func (bu *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 	return false, nil
 }
 
-func (bu *Bucket) SetBlob(ctx context.Context, key string, data []byte) error {
+type WriteOption interface {
+	writeOption()
+}
+
+type OptWriteCacheTTL struct {
+	TTL time.Duration
+}
+
+func (o *OptWriteCacheTTL) writeOption() {}
+
+func (bu *Bucket) SetBlob(ctx context.Context, key string, data []byte, opts ...WriteOption) error {
 	key += ".zst"
 	if bu.bucket != nil {
 		var opts *blob.WriterOptions
@@ -231,13 +242,33 @@ func (bu *Bucket) SetBlob(ctx context.Context, key string, data []byte) error {
 	}
 	if bu.cache != nil {
 		err := bu.cache.Update(func(txn *badger.Txn) error {
-			return txn.Set(bu.cacheKey(key), data)
+			entry := bu.newEntry(key, data, opts)
+			return txn.SetEntry(entry)
 		})
 		if err != nil {
 			log.Err(err).Msg("failed to set cache")
 		}
 	}
 	return nil
+}
+
+func (bu *Bucket) newEntry(
+	key string,
+	data []byte,
+	opts []WriteOption,
+) *badger.Entry {
+	ttl := defaultCacheTTL
+	for _, opt := range opts {
+		switch opt := opt.(type) {
+		case *OptWriteCacheTTL:
+			ttl = opt.TTL
+		}
+	}
+	entry := badger.NewEntry(bu.cacheKey(key), data).WithDiscard()
+	if ttl > 0 {
+		entry.WithTTL(ttl)
+	}
+	return entry
 }
 
 // NotFoundError is returned when a key is not found in the bucket.
@@ -324,7 +355,8 @@ func (bu *Bucket) GetBlob(ctx context.Context, key string) (b *Blob, err error) 
 		}
 		if cacheData == nil && bu.cache != nil {
 			err := bu.cache.Update(func(txn *badger.Txn) error {
-				return txn.Set(bu.cacheKey(key), data)
+				entry := bu.newEntry(key, data, nil)
+				return txn.SetEntry(entry)
 			})
 			if err != nil {
 				log.Err(err).Msg("failed to set cache")
