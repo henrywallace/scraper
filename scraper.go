@@ -295,13 +295,14 @@ func (s *Scraper) fetchPlain(
 
 	// Retry, as reading the body can fail outside the purview of the
 	// retryablehttp api. Or, the read body could indicate that the request
-	// should be retried. Adding it to the CheckRetry func would be awkward
-	// as it would involve conditionally forwarding an already read body.
+	// should be retried. The alternative of adding it to the CheckRetry
+	// func would be too awkward as it would involve conditionally
+	// forwarding an already read body.
 	var resp *http.Response
 	var body []byte
-	attemptsMax := 7
+	attemptsMax := 5
 	waitMin := 1 * time.Second
-	waitMax := 4 * time.Minute
+	waitMax := 1 * time.Minute
 	waitJitter := 1 * time.Second
 	wait := func(attempt int) {
 		d := time.Duration(math.Pow(2, float64(attempt))) * waitMin
