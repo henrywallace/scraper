@@ -281,6 +281,7 @@ func (e *NotFoundError) Error() string {
 }
 
 type Blob struct {
+	Key    string
 	Data   []byte
 	Source string
 }
@@ -362,7 +363,11 @@ func (bu *Bucket) GetBlob(ctx context.Context, key string) (b *Blob, err error) 
 				log.Err(err).Msg("failed to set cache")
 			}
 		}
-		return &Blob{Data: data, Source: "remote"}, nil
+		return &Blob{
+			Key:    key,
+			Data:   data,
+			Source: "remote",
+		}, nil
 	}
 
 	return nil, &NotFoundError{Key: key}
