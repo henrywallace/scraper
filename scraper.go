@@ -686,7 +686,7 @@ var _ retryablehttp.LeveledLogger = (*leveledLogger)(nil)
 type leveledLogger struct{ log *zerolog.Logger }
 
 func (l leveledLogger) fields(keysAndValues []any) *zerolog.Logger {
-	log := l.log.With()
+	log := l.log.With().CallerWithSkipFrameCount(3)
 	for i := 0; i < len(keysAndValues); i += 2 {
 		key := fmt.Sprintf("%v", keysAndValues[i])
 		val := keysAndValues[i+1]
