@@ -201,7 +201,7 @@ func (bu *Bucket) Exists(ctx context.Context, key string) (ok bool, err error) {
 	return false, nil
 }
 
-func (bu *Bucket) Write(ctx context.Context, key string, data []byte) error {
+func (bu *Bucket) SetBlob(ctx context.Context, key string, data []byte) error {
 	key += ".zst"
 	if bu.bucket != nil {
 		var opts *blob.WriterOptions
@@ -254,7 +254,7 @@ type Blob struct {
 	Source string
 }
 
-func (bu *Bucket) Read(ctx context.Context, key string) (b *Blob, err error) {
+func (bu *Bucket) GetBlob(ctx context.Context, key string) (b *Blob, err error) {
 	if bu.cache == nil && bu.bucket == nil {
 		return nil, errors.New("neither cache nor external bucket is configured")
 	}
@@ -399,7 +399,7 @@ func (it *ListIterator) Key() string {
 }
 
 func (it *ListIterator) Value(ctx context.Context) (*Blob, error) {
-	return it.b.Read(ctx, it.Key())
+	return it.b.GetBlob(ctx, it.Key())
 }
 
 func (bu *Bucket) cacheKey(key string) []byte {

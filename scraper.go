@@ -471,44 +471,34 @@ func (s *Scraper) fetchBrowser(
 		return nil, fmt.Errorf("failed to intercept browser routes: %w", err)
 	}
 
-	page, err := context.NewPage()
+	browserPage, err := context.NewPage()
 	if err != nil {
 		return nil, fmt.Errorf("could not create page: %w", err)
 	}
 
-	page.On("request", func(req playwright.Request) {
+	browserPage.On("request", func(req playwright.Request) {
 		log.Debug().
 			Str("url", req.URL()).
 			Str("method", req.Method()).
 			Msg("browser making page request")
 	})
-	page.On("response", func(resp playwright.Response) {
-		b, _ := resp.Body()
-		log.Debug().
-			Str("url", resp.URL()).
-			Int("status", resp.Status()).
-			// Stringer("dur", time.Since(resp.Request().Timing().StartTime))  FIXME
-			Int("bytes", len(b)).
-			Msg("got page response")
-	})
-
-	resp, err := page.Goto(req.URL.String(), playwright.PageGotoOptions{
+	resp, err := browserPage.Goto(req.URL.String(), playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("page failed to goto url: %w", err)
 	}
-	html, err := page.Content()
+	html, err := browserPage.Content()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get content from page: %w", err)
 	}
-	respHeaders := make(http.Header)
+	header := make(http.Header)
 	allHeaders, err := resp.AllHeaders()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get page response headers: %w", err)
 	}
 	for key, value := range allHeaders {
-		respHeaders.Set(key, value)
+		header.Set(key, value)
 	}
 	return &Page{
 		Meta: PageMeta{
@@ -520,7 +510,7 @@ func (s *Scraper) fetchBrowser(
 			URL:           resp.URL(),
 			RedirectedURL: "", // unknown
 			Method:        req.Method,
-			Header:        respHeaders,
+			Header:        header,
 			Body:          nil,
 		},
 		Response: PageResponse{
@@ -543,7 +533,7 @@ func (s *Scraper) do(
 	}
 
 	if !opts.Replace {
-		b, err := s.bucket.Read(ctx, bkey)
+		b, err := s.bucket.GetBlob(ctx, bkey)
 		if !errors.As(err, lo.ToPtr(&blob.NotFoundError{})) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to read from blob: %w", err)
@@ -573,7 +563,7 @@ func (s *Scraper) do(
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal page: %w", err)
 	}
-	if err := s.bucket.Write(ctx, bkey, b); err != nil {
+	if err := s.bucket.SetBlob(ctx, bkey, b); err != nil {
 		return nil, fmt.Errorf("failed to write page: %w", err)
 	}
 	if err := errPageStatusNotOK(page); err != nil {
