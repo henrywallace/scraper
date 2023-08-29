@@ -473,7 +473,7 @@ func (s *Scraper) fetchBrowser(
 			for k, v := range req.Headers() {
 				r.Header.Set(k, v)
 			}
-			return s.do(ctx, r, opts, s.fetchPlain)
+			return s.fetchPlain(ctx, r, reqBody, opts)
 		})
 	})
 	if err != nil {
