@@ -286,7 +286,7 @@ type fetchFn func(
 // To prevent potential DoS we use http.MaxBytesReader to cap the size of the
 // request body that can be read.
 func (s *Scraper) fetchPlain(
-	_ context.Context,
+	ctx context.Context,
 	req *http.Request,
 	reqBody []byte,
 	opts doOptions,
@@ -304,15 +304,26 @@ func (s *Scraper) fetchPlain(
 	waitMin := 1 * time.Second
 	waitMax := 1 * time.Minute
 	waitJitter := 1 * time.Second
-	wait := func(attempt int) {
+	wait := func(attempt int) error {
 		d := time.Duration(math.Pow(2, float64(attempt))) * waitMin
 		d += time.Duration(rand.Intn(int(waitJitter)))
 		if d > waitMax {
 			d = waitMax
 		}
-		time.Sleep(d)
+		t := time.After(d)
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t:
+				return nil
+			}
+		}
 	}
 	for i := 0; i < attemptsMax; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rreq, err := retryablehttp.FromRequest(req)
 		if err != nil {
 			return nil, err
@@ -332,8 +343,10 @@ func (s *Scraper) fetchPlain(
 			if lastAttempt {
 				return nil, fmt.Errorf("failed to read http resp body: %w", err)
 			}
-			log.Warn().Int("attempt", i).Msg("failed to read http resp body, retrying")
-			wait(i)
+			log.Warn().Err(err).Int("attempt", i).Msg("failed to read http resp body, retrying")
+			if err := wait(i); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if opts.ReSilentThrottle != nil && opts.ReSilentThrottle.Match(body) {
@@ -346,8 +359,9 @@ func (s *Scraper) fetchPlain(
 				return nil, &FetchThrottledError{}
 			}
 			log.Warn().Int("attempt", i).Msg("response is silently throttled, retrying")
-			time.Sleep(10 * time.Second)
-			wait(i)
+			if err := wait(i); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		break
